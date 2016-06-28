@@ -26,6 +26,18 @@ module Helpers =
     let inline ignore2 _ = ignore
     let inline ignore3 _ = ignore2
 
+    let both f1 f2 a : unit =
+        f1 a
+        f2 a
+
+    let both2 f1 f2 a1 a2 : unit =
+        f1 a1 a2
+        f2 a1 a2
+
+    let both3 f1 f2 a1 a2 a3 : unit =
+        f1 a1 a2 a3
+        f2 a1 a2 a3
+
     let bracket setup teardown f () =
         let v = setup()
         try
@@ -229,6 +241,23 @@ module Impl =
             Failed = ignore3
             Exception = ignore3
         }
+        static member TeamCity = {
+            BeforeRun =
+                printfn "##teamcity[testStarted name='%s' captureStandardOutput='true']"
+            Passed = fun name duration ->
+                round duration.TotalMilliseconds
+                |> printfn "##teamcity[testFinished name='%s' duration='%f']" name
+            Ignored =
+                printfn "##teamcity[testIgnored name='%s' message='%s']"
+            Failed = fun name msg duration ->
+                printfn "##teamcity[testFailed name='%s' message='%s' details='']" name msg
+                round duration.TotalMilliseconds
+                |> printfn "##teamcity[testFinished name='%s' duration='%f']" name
+            Exception = fun name ex duration ->
+                printfn "##teamcity[testFailed name='%s' message='%s' details='%A']" name ex.Message ex
+                round duration.TotalMilliseconds
+                |> printfn "##teamcity[testFinished name='%s' duration='%f']" name
+        }
 
     /// Runs a list of tests, with parameterized printers (progress indicators) and traversal.
     /// Returns list of results.
@@ -302,10 +331,15 @@ module Impl =
     let printFailed = tprintf "%s: Failed: %s (%A)\n"
     let printException name ex = tprintf "%s: Exception: %s (%A)\n" name (exnToString ex)
 
+    let testPrinters teamCity =
+        if teamCity
+        then TestPrinters.TeamCity
+        else TestPrinters.Default
+
     /// Evaluates tests sequentially
-    let evalSeq = 
+    let evalSeq printers = 
         let printer = 
-            { TestPrinters.Default with 
+            { printers with 
                 Failed = printFailed
                 Exception = printException }
 
@@ -314,15 +348,15 @@ module Impl =
     let pmap (f: _ -> _) (s: _ seq) = s.AsParallel().Select(f) :> _ seq
 
     /// Evaluates tests in parallel
-    let evalPar =
+    let evalPar printers =
         let funLock =
             let locker = obj()
             lock locker
         let inline funLock3 f a b c = funLock (fun () -> f a b c)
-        let printFailed = funLock3 printFailed 
-        let printException = funLock3 printException
+        let printFailed = funLock3 <| both3 printers.Failed printFailed
+        let printException = funLock3 <| both3 printers.Exception printException
         let printer = 
-            { TestPrinters.Default with 
+            { printers with 
                 Failed = printFailed
                 Exception = printException }
         eval printer pmap
@@ -454,20 +488,41 @@ module Tests =
     let inline (==>) name test = name,test
 
     /// Runs tests
+    [<Extension; CompiledName("RunWith")>]
+    let runWith printers tests = runEval (evalSeq printers) tests
+    
+    /// Runs tests in parallel
+    [<Extension; CompiledName("RunParallelWith")>]
+    let runParallelWith printers tests = runEval (evalPar printers) tests
+
+    /// Runs tests
     [<Extension; CompiledName("Run")>]
-    let run tests = runEval evalSeq tests
+    let run tests = runWith TestPrinters.Default tests
     
     /// Runs tests in parallel
     [<Extension; CompiledName("RunParallel")>]
-    let runParallel tests = runEval evalPar tests
+    let runParallel tests = runParallelWith TestPrinters.Default
+
+    type TeamCityOutput = EnvVariable | ForceYes | ForceNo
 
     // Runner options
-    type RunOptions = { Parallel: bool }
+    type RunOptions = {
+        Parallel: bool
+        TeamCity : bool
+    }
 
     /// Parses command-line arguments
     let parseArgs =
-        let defaultOptions = { RunOptions.Parallel = false }
-        let opts = [ "/m", fun o -> { o with RunOptions.Parallel = true } ]
+        let defaultOptions = {
+            Parallel = false
+            TeamCity = false
+        }
+        let opts = [
+            "/m", fun o -> { o with Parallel = true }
+            "/teamcity", fun o -> { o with TeamCity = true }
+            "-m", fun o -> { o with Parallel = true }
+            "--teamcity", fun o -> { o with TeamCity = true }
+        ]
         fun (args: string[]) ->
             (defaultOptions, args) 
             ||> Seq.fold (fun opt arg -> 
@@ -476,8 +531,8 @@ module Tests =
     /// Runs tests with supplied options. Returns 0 if all tests passed, otherwise 1
     [<CompiledNameAttribute("DefaultMainWithOptions")>]
     let defaultMainWithOptions tests (options: RunOptions) = 
-        let run = if options.Parallel then runParallel else run
-        run tests
+        let runWith = if options.Parallel then runParallelWith else runWith
+        runWith (testPrinters options.TeamCity) tests
     
     /// Runs tests with supplied command-line options. Returns 0 if all tests passed, otherwise 1
     [<CompiledNameAttribute("DefaultMain")>]
